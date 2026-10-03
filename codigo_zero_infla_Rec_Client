@@ -1,0 +1,768 @@
+"""
+PROJETO: Silent Detractors
+Identificacao de reclamacoes ocultas com modelos zero-inflacionados
+
+Arquivo de entrada esperado:
+    base_ficticia_zero_inflacionado_2000_clientes.xlsx
+
+Aba principal:
+    dados_cliente_periodo
+
+Modelos comparados:
+    1. Poisson
+    2. Binomial Negativa
+    3. Poisson Zero-Inflacionado, ZIP
+    4. Binomial Negativa Zero-Inflacionada, ZINB
+
+Observacao importante:
+Os dados utilizados neste projeto sao sinteticos. As classificacoes representam
+probabilidades estatisticas, e nao uma determinacao individual definitiva.
+"""
+
+# ============================================================
+# 1. IMPORTACAO DAS BIBLIOTECAS
+# ============================================================
+
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from scipy.special import expit
+from scipy.stats import nbinom
+from patsy import dmatrix
+
+import statsmodels.api as sm
+from statsmodels.discrete.discrete_model import Poisson, NegativeBinomial
+from statsmodels.discrete.count_model import (
+    ZeroInflatedPoisson,
+    ZeroInflatedNegativeBinomialP,
+)
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 2. CONFIGURACOES DO PROJETO
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+ARQUIVO_ENTRADA = BASE_DIR / "base_ficticia_zero_inflacionado_2000_clientes.xlsx"
+ARQUIVO_SAIDA = BASE_DIR / "resultados_modelo_zero_inflacionado_python.xlsx"
+PASTA_GRAFICOS = BASE_DIR / "graficos_modelo"
+PASTA_GRAFICOS.mkdir(exist_ok=True)
+
+ABA_DADOS = "dados_cliente_periodo"
+ABA_VALIDACAO = "validacao_ground_truth"
+
+# Limites ilustrativos de classificacao. Em aplicacao real, devem ser
+# calibrados com dados rotulados ou uma pesquisa de validacao.
+LIMITE_RISCO_MODERADO = 0.40
+LIMITE_RISCO_ALTO = 0.70
+LIMITE_ZERO_ESTRUTURAL = 0.70
+
+# ============================================================
+# 3. FUNCOES AUXILIARES
+# ============================================================
+
+def verificar_colunas(dados: pd.DataFrame, colunas: list[str]) -> None:
+    """Interrompe a execucao quando faltam colunas obrigatorias."""
+    faltantes = [coluna for coluna in colunas if coluna not in dados.columns]
+    if faltantes:
+        raise ValueError(f"Colunas obrigatorias ausentes: {faltantes}")
+
+
+def padronizar_serie(serie: pd.Series) -> pd.Series:
+    """Padroniza uma variavel numerica, preservando o indice."""
+    serie = pd.to_numeric(serie, errors="coerce")
+    desvio = serie.std(ddof=0)
+    if pd.isna(desvio) or desvio == 0:
+        return pd.Series(np.zeros(len(serie)), index=serie.index)
+    return (serie - serie.mean()) / desvio
+
+
+def construir_matriz(dados: pd.DataFrame, formula: str) -> pd.DataFrame:
+    """Cria uma matriz de projeto com intercepto e variaveis categoricas."""
+    return dmatrix(formula, dados, return_type="dataframe")
+
+
+def obter_metricas_modelo(nome: str, resultado) -> dict:
+    """Extrai metricas comparaveis dos modelos ajustados."""
+    return {
+        "modelo": nome,
+        "AIC": float(resultado.aic),
+        "BIC": float(resultado.bic),
+        "logLik": float(resultado.llf),
+        "numero_parametros": int(len(resultado.params)),
+        "convergiu": bool(getattr(resultado, "mle_retvals", {}).get("converged", True)),
+    }
+
+
+def tabela_coeficientes(resultado, nome_modelo: str) -> pd.DataFrame:
+    """Cria tabela com coeficientes, erros, p-valores e razoes exponenciadas."""
+    intervalo = resultado.conf_int()
+    tabela = pd.DataFrame({
+        "termo": resultado.params.index,
+        "coeficiente": resultado.params.values,
+        "erro_padrao": resultado.bse.values,
+        "estatistica_z": resultado.tvalues.values,
+        "p_valor": resultado.pvalues.values,
+        "limite_inferior_95": intervalo.iloc[:, 0].values,
+        "limite_superior_95": intervalo.iloc[:, 1].values,
+    })
+    tabela["razao_exponenciada"] = np.exp(tabela["coeficiente"].clip(-20, 20))
+    tabela["modelo"] = nome_modelo
+    tabela["componente"] = np.where(
+        tabela["termo"].str.startswith("inflate_"),
+        "inflacao_zero",
+        np.where(tabela["termo"].eq("alpha"), "dispersao", "contagem"),
+    )
+    return tabela
+
+
+def calcular_vif(matriz: pd.DataFrame) -> pd.DataFrame:
+    """Calcula VIF para as colunas preditoras, exceto intercepto."""
+    from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+    x = matriz.copy()
+    if "Intercept" in x.columns:
+        x = x.drop(columns="Intercept")
+
+    registros = []
+    for i, coluna in enumerate(x.columns):
+        try:
+            vif = variance_inflation_factor(x.values, i)
+        except Exception:
+            vif = np.nan
+        registros.append({"variavel": coluna, "VIF": vif})
+    return pd.DataFrame(registros).sort_values("VIF", ascending=False)
+
+
+def quantil_residuo_aleatorizado(y: np.ndarray, mu: np.ndarray, alpha: float) -> np.ndarray:
+    """
+    Gera uma aproximacao de residuos quantilicos aleatorizados para ZINB.
+    Utilizada apenas como diagnostico complementar.
+    """
+    rng = np.random.default_rng(20260828)
+    size = 1.0 / max(alpha, 1e-8)
+    prob = size / (size + np.maximum(mu, 1e-12))
+
+    limite_inferior = nbinom.cdf(np.maximum(y - 1, -1), size, prob)
+    limite_superior = nbinom.cdf(y, size, prob)
+    uniforme = rng.uniform(limite_inferior, limite_superior)
+
+    from scipy.stats import norm
+    uniforme = np.clip(uniforme, 1e-8, 1 - 1e-8)
+    return norm.ppf(uniforme)
+
+# ============================================================
+# 4. LEITURA DOS DADOS
+# ============================================================
+
+if not ARQUIVO_ENTRADA.exists():
+    raise FileNotFoundError(
+        f"Arquivo nao encontrado: {ARQUIVO_ENTRADA}\n"
+        "Coloque o Excel na mesma pasta deste script ou altere ARQUIVO_ENTRADA."
+    )
+
+dados = pd.read_excel(
+    ARQUIVO_ENTRADA,
+    sheet_name=ABA_DADOS,
+    engine="openpyxl",
+)
+
+try:
+    ground_truth = pd.read_excel(
+        ARQUIVO_ENTRADA,
+        sheet_name=ABA_VALIDACAO,
+        engine="openpyxl",
+    )
+except ValueError:
+    ground_truth = pd.DataFrame()
+
+print("=" * 70)
+print("BASE CARREGADA")
+print("=" * 70)
+print(f"Linhas: {len(dados):,}")
+print(f"Colunas: {dados.shape[1]}")
+print(f"Clientes unicos: {dados['id_cliente'].nunique():,}")
+
+# ============================================================
+# 5. VALIDACAO E PREPARACAO
+# ============================================================
+
+colunas_obrigatorias = [
+    "id_cliente",
+    "periodo",
+    "dias_exposicao",
+    "segmento",
+    "qtd_reclamacoes",
+    "qtd_compras",
+    "qtd_interacoes",
+    "qtd_atrasos",
+    "qtd_devolucoes",
+    "qtd_falhas_registradas",
+    "severidade_maxima",
+    "problema_detectado_internamente",
+    "tempo_resolucao_horas",
+    "conhece_canal_reclamacao",
+    "acessou_pagina_ajuda",
+    "abandonou_formulario",
+    "erro_no_canal",
+    "tempo_espera_canal_minutos",
+    "dificuldade_canal",
+    "tempo_disponivel_percebido",
+    "confianca_na_resolucao",
+    "churn_periodo_seguinte",
+]
+verificar_colunas(dados, colunas_obrigatorias)
+
+# Chave unica cliente-periodo
+duplicidades = dados.duplicated(subset=["id_cliente", "periodo"], keep=False)
+if duplicidades.any():
+    raise ValueError(
+        f"Existem {duplicidades.sum()} linhas com chave id_cliente + periodo duplicada."
+    )
+
+# Conversao das variaveis numericas
+colunas_numericas = [
+    "dias_exposicao",
+    "qtd_reclamacoes",
+    "qtd_compras",
+    "qtd_interacoes",
+    "qtd_atrasos",
+    "qtd_devolucoes",
+    "qtd_falhas_registradas",
+    "severidade_maxima",
+    "problema_detectado_internamente",
+    "tempo_resolucao_horas",
+    "conhece_canal_reclamacao",
+    "acessou_pagina_ajuda",
+    "abandonou_formulario",
+    "erro_no_canal",
+    "tempo_espera_canal_minutos",
+    "dificuldade_canal",
+    "tempo_disponivel_percebido",
+    "confianca_na_resolucao",
+    "churn_periodo_seguinte",
+]
+
+for coluna in colunas_numericas:
+    dados[coluna] = pd.to_numeric(dados[coluna], errors="coerce")
+
+if (dados["qtd_reclamacoes"].dropna() < 0).any():
+    raise ValueError("A variavel qtd_reclamacoes contem valores negativos.")
+
+if (dados["dias_exposicao"].dropna() <= 0).any():
+    raise ValueError("A variavel dias_exposicao contem valores menores ou iguais a zero.")
+
+# Remocao apenas das linhas sem variaveis indispensaveis ao modelo
+dados_modelo = dados.dropna(subset=colunas_obrigatorias).copy()
+
+# Tipos e variaveis derivadas
+dados_modelo["id_cliente"] = dados_modelo["id_cliente"].astype(str)
+dados_modelo["segmento"] = dados_modelo["segmento"].astype("category")
+dados_modelo["qtd_reclamacoes"] = dados_modelo["qtd_reclamacoes"].astype(int)
+dados_modelo["teve_reclamacao"] = (dados_modelo["qtd_reclamacoes"] > 0).astype(int)
+dados_modelo["log_exposicao"] = np.log(dados_modelo["dias_exposicao"])
+
+# Padronizacao
+dados_modelo["qtd_compras_z"] = padronizar_serie(dados_modelo["qtd_compras"])
+dados_modelo["qtd_interacoes_z"] = padronizar_serie(dados_modelo["qtd_interacoes"])
+dados_modelo["qtd_atrasos_z"] = padronizar_serie(dados_modelo["qtd_atrasos"])
+dados_modelo["qtd_falhas_z"] = padronizar_serie(dados_modelo["qtd_falhas_registradas"])
+dados_modelo["tempo_resolucao_z"] = padronizar_serie(dados_modelo["tempo_resolucao_horas"])
+dados_modelo["tempo_espera_z"] = padronizar_serie(dados_modelo["tempo_espera_canal_minutos"])
+
+# ============================================================
+# 6. ANALISE EXPLORATORIA
+# ============================================================
+
+media = dados_modelo["qtd_reclamacoes"].mean()
+variancia = dados_modelo["qtd_reclamacoes"].var()
+proporcao_zeros = dados_modelo["qtd_reclamacoes"].eq(0).mean()
+razao_var_media = variancia / media if media > 0 else np.nan
+
+resumo_base = pd.DataFrame({
+    "metrica": [
+        "linhas_modeladas",
+        "clientes_unicos",
+        "total_reclamacoes",
+        "media_reclamacoes",
+        "variancia_reclamacoes",
+        "razao_variancia_media",
+        "proporcao_zeros",
+    ],
+    "valor": [
+        len(dados_modelo),
+        dados_modelo["id_cliente"].nunique(),
+        dados_modelo["qtd_reclamacoes"].sum(),
+        media,
+        variancia,
+        razao_var_media,
+        proporcao_zeros,
+    ],
+})
+print("\nRESUMO DA VARIAVEL RESPOSTA")
+print(resumo_base.to_string(index=False))
+
+sns.set_theme(style="whitegrid")
+plt.figure(figsize=(10, 6))
+sns.countplot(
+    data=dados_modelo,
+    x="qtd_reclamacoes",
+    color="#2C7FB8",
+)
+plt.title("Distribuicao da quantidade de reclamacoes")
+plt.xlabel("Quantidade de reclamacoes")
+plt.ylabel("Numero de observacoes")
+plt.tight_layout()
+plt.savefig(PASTA_GRAFICOS / "01_distribuicao_reclamacoes.png", dpi=160)
+plt.close()
+
+# ============================================================
+# 7. MATRIZES DOS MODELOS
+# ============================================================
+
+# Componente de contagem: fatores associados a quantidade de reclamacoes.
+formula_contagem = """
+1 + qtd_compras_z
+  + qtd_interacoes_z
+  + qtd_atrasos_z
+  + qtd_falhas_z
+  + severidade_maxima
+  + problema_detectado_internamente
+  + tempo_resolucao_z
+  + C(segmento)
+"""
+
+# Componente de inflacao de zeros: fatores associados a pertencer ao
+# processo latente que gera zeros adicionais.
+formula_inflacao = """
+1 + conhece_canal_reclamacao
+  + acessou_pagina_ajuda
+  + abandonou_formulario
+  + erro_no_canal
+  + tempo_espera_z
+  + dificuldade_canal
+  + tempo_disponivel_percebido
+  + confianca_na_resolucao
+"""
+
+X_contagem = construir_matriz(dados_modelo, formula_contagem)
+X_inflacao = construir_matriz(dados_modelo, formula_inflacao)
+y = dados_modelo["qtd_reclamacoes"].astype(float)
+offset = dados_modelo["log_exposicao"].astype(float)
+
+vif = calcular_vif(X_contagem)
+
+# ============================================================
+# 8. AJUSTE DOS MODELOS
+# ============================================================
+
+print("\nAjustando modelo Poisson...")
+modelo_poisson = Poisson(
+    endog=y,
+    exog=X_contagem,
+    offset=offset,
+)
+resultado_poisson = modelo_poisson.fit(
+    method="newton",
+    maxiter=300,
+    disp=False,
+)
+
+print("Ajustando modelo Binomial Negativa...")
+modelo_nb = NegativeBinomial(
+    endog=y,
+    exog=X_contagem,
+    offset=offset,
+)
+resultado_nb = modelo_nb.fit(
+    method="bfgs",
+    maxiter=500,
+    disp=False,
+)
+
+print("Ajustando modelo ZIP...")
+modelo_zip = ZeroInflatedPoisson(
+    endog=y,
+    exog=X_contagem,
+    exog_infl=X_inflacao,
+    offset=offset,
+    inflation="logit",
+)
+resultado_zip = modelo_zip.fit(
+    method="bfgs",
+    maxiter=800,
+    disp=False,
+)
+
+print("Ajustando modelo ZINB...")
+modelo_zinb = ZeroInflatedNegativeBinomialP(
+    endog=y,
+    exog=X_contagem,
+    exog_infl=X_inflacao,
+    offset=offset,
+    inflation="logit",
+    p=2,
+)
+resultado_zinb = modelo_zinb.fit(
+    method="bfgs",
+    maxiter=1200,
+    disp=False,
+)
+
+# ============================================================
+# 9. COMPARACAO DOS MODELOS
+# ============================================================
+
+comparacao_modelos = pd.DataFrame([
+    obter_metricas_modelo("Poisson", resultado_poisson),
+    obter_metricas_modelo("Binomial Negativa", resultado_nb),
+    obter_metricas_modelo("ZIP", resultado_zip),
+    obter_metricas_modelo("ZINB", resultado_zinb),
+]).sort_values("AIC").reset_index(drop=True)
+
+print("\nCOMPARACAO DOS MODELOS")
+print(comparacao_modelos.to_string(index=False))
+
+coeficientes_poisson = tabela_coeficientes(resultado_poisson, "Poisson")
+coeficientes_nb = tabela_coeficientes(resultado_nb, "Binomial Negativa")
+coeficientes_zip = tabela_coeficientes(resultado_zip, "ZIP")
+coeficientes_zinb = tabela_coeficientes(resultado_zinb, "ZINB")
+
+# ============================================================
+# 10. PREVISOES DO MODELO ZINB
+# ============================================================
+
+# Media total esperada, incorporando o processo de inflacao de zeros.
+dados_modelo["reclamacoes_esperadas"] = resultado_zinb.predict(which="mean")
+
+# Media do processo principal de contagem, antes da inflacao de zeros.
+dados_modelo["media_condicional"] = resultado_zinb.predict(which="mean-main")
+
+# Probabilidade de permanecer no processo principal de contagem.
+prob_processo_principal = resultado_zinb.predict(which="prob-main")
+
+# Probabilidade a priori de pertencer ao componente de zeros adicionais.
+dados_modelo["prob_zero_estrutural_prior"] = 1.0 - prob_processo_principal
+
+# Parametro alpha da parametrizacao NB2:
+# Var(Y) = mu + alpha * mu^2
+alpha = float(resultado_zinb.params.get("alpha", np.nan))
+if not np.isfinite(alpha) or alpha <= 0:
+    raise ValueError("O parametro alpha do ZINB nao foi estimado corretamente.")
+
+size = 1.0 / alpha
+mu = np.maximum(dados_modelo["media_condicional"].to_numpy(), 1e-12)
+prob_nb = size / (size + mu)
+
+# Probabilidade de zero produzido pelo componente de contagem NB.
+dados_modelo["prob_zero_processo_contagem"] = nbinom.pmf(
+    0,
+    size,
+    prob_nb,
+)
+
+pi = dados_modelo["prob_zero_estrutural_prior"].to_numpy()
+p_zero_contagem = dados_modelo["prob_zero_processo_contagem"].to_numpy()
+
+denominador = pi + (1.0 - pi) * p_zero_contagem
+posterior_estrutural = np.divide(
+    pi,
+    denominador,
+    out=np.zeros_like(pi),
+    where=denominador > 0,
+)
+
+eh_zero = dados_modelo["qtd_reclamacoes"].eq(0).to_numpy()
+
+dados_modelo["prob_zero_estrutural_posterior"] = np.where(
+    eh_zero,
+    posterior_estrutural,
+    np.nan,
+)
+
+dados_modelo["prob_zero_processo_reclamacao"] = np.where(
+    eh_zero,
+    1.0 - posterior_estrutural,
+    np.nan,
+)
+
+# ============================================================
+# 11. SCORE DE RECLAMACAO SILENCIOSA
+# ============================================================
+
+indicadores_problema = pd.DataFrame({
+    "problema_interno": dados_modelo["problema_detectado_internamente"].fillna(0).astype(int),
+    "atraso": dados_modelo["qtd_atrasos"].fillna(0).gt(0).astype(int),
+    "devolucao": dados_modelo["qtd_devolucoes"].fillna(0).gt(0).astype(int),
+    "falha": dados_modelo["qtd_falhas_registradas"].fillna(0).gt(0).astype(int),
+})
+
+dados_modelo["evidencia_problema"] = indicadores_problema.max(axis=1)
+
+dados_modelo["score_reclamacao_silenciosa"] = np.where(
+    dados_modelo["qtd_reclamacoes"].eq(0),
+    dados_modelo["prob_zero_processo_reclamacao"]
+    * (0.5 + 0.5 * dados_modelo["evidencia_problema"]),
+    0.0,
+)
+
+condicoes = [
+    dados_modelo["qtd_reclamacoes"].gt(0),
+    (
+        dados_modelo["qtd_reclamacoes"].eq(0)
+        & dados_modelo["prob_zero_estrutural_posterior"].ge(LIMITE_ZERO_ESTRUTURAL)
+        & dados_modelo["evidencia_problema"].eq(0)
+    ),
+    (
+        dados_modelo["qtd_reclamacoes"].eq(0)
+        & dados_modelo["score_reclamacao_silenciosa"].ge(LIMITE_RISCO_ALTO)
+    ),
+    (
+        dados_modelo["qtd_reclamacoes"].eq(0)
+        & dados_modelo["score_reclamacao_silenciosa"].ge(LIMITE_RISCO_MODERADO)
+    ),
+    dados_modelo["qtd_reclamacoes"].eq(0),
+]
+
+classes = [
+    "Reclamante observado",
+    "Provavel zero sem problema",
+    "Alto risco de reclamacao silenciosa",
+    "Risco moderado de reclamacao silenciosa",
+    "Zero nao conclusivo",
+]
+
+dados_modelo["classificacao_cliente"] = np.select(
+    condicoes,
+    classes,
+    default="Nao classificado",
+)
+
+# ============================================================
+# 12. RANKING E RESUMOS
+# ============================================================
+
+colunas_ranking = [
+    "id_cliente",
+    "periodo",
+    "qtd_reclamacoes",
+    "problema_detectado_internamente",
+    "qtd_atrasos",
+    "qtd_devolucoes",
+    "qtd_falhas_registradas",
+    "acessou_pagina_ajuda",
+    "abandonou_formulario",
+    "tempo_espera_canal_minutos",
+    "prob_zero_estrutural_posterior",
+    "prob_zero_processo_reclamacao",
+    "score_reclamacao_silenciosa",
+    "classificacao_cliente",
+]
+
+ranking_silenciosos = (
+    dados_modelo.loc[dados_modelo["qtd_reclamacoes"].eq(0), colunas_ranking]
+    .sort_values("score_reclamacao_silenciosa", ascending=False)
+    .reset_index(drop=True)
+)
+
+resumo_classificacao = (
+    dados_modelo["classificacao_cliente"]
+    .value_counts(dropna=False)
+    .rename_axis("classificacao_cliente")
+    .reset_index(name="quantidade")
+)
+resumo_classificacao["percentual"] = (
+    resumo_classificacao["quantidade"] / resumo_classificacao["quantidade"].sum()
+)
+
+validacao_churn = (
+    dados_modelo.dropna(subset=["churn_periodo_seguinte"])
+    .groupby("classificacao_cliente", as_index=False)
+    .agg(
+        quantidade=("id_cliente", "size"),
+        taxa_churn=("churn_periodo_seguinte", "mean"),
+    )
+    .sort_values("taxa_churn", ascending=False)
+)
+
+# ============================================================
+# 13. VALIDACAO COM GROUND TRUTH SIMULADO
+# ============================================================
+
+avaliacao_ground_truth = pd.DataFrame()
+matriz_confusao = pd.DataFrame()
+
+if not ground_truth.empty:
+    gt = ground_truth.copy()
+    gt = gt.loc[gt["classe_real_zero"].isin([
+        "sem_problema",
+        "problema_sem_reclamacao",
+    ])].copy()
+
+    avaliacao_ground_truth = dados_modelo.merge(
+        gt[["id_cliente", "periodo", "classe_real_zero"]],
+        on=["id_cliente", "periodo"],
+        how="inner",
+    )
+
+    if not avaliacao_ground_truth.empty:
+        avaliacao_ground_truth["classe_prevista_binaria"] = np.where(
+            avaliacao_ground_truth["score_reclamacao_silenciosa"].ge(LIMITE_RISCO_MODERADO),
+            "problema_sem_reclamacao",
+            "sem_problema",
+        )
+
+        matriz_confusao = pd.crosstab(
+            avaliacao_ground_truth["classe_real_zero"],
+            avaliacao_ground_truth["classe_prevista_binaria"],
+            rownames=["classe_real"],
+            colnames=["classe_prevista"],
+        ).reset_index()
+
+# ============================================================
+# 14. DIAGNOSTICOS GRAFICOS
+# ============================================================
+
+# Observado versus esperado por quantidade de reclamacoes.
+frequencia_observada = (
+    dados_modelo["qtd_reclamacoes"]
+    .value_counts()
+    .sort_index()
+    .rename("observado")
+)
+
+# Simulacao preditiva simples a partir das probabilidades ZINB ajustadas.
+rng = np.random.default_rng(20260828)
+pi = dados_modelo["prob_zero_estrutural_prior"].to_numpy()
+zero_estrutural_sim = rng.binomial(1, pi)
+contagem_sim = nbinom.rvs(size, prob_nb, random_state=rng)
+y_simulado = np.where(zero_estrutural_sim == 1, 0, contagem_sim)
+
+frequencia_simulada = (
+    pd.Series(y_simulado)
+    .value_counts()
+    .sort_index()
+    .rename("simulado")
+)
+
+comparacao_frequencias = pd.concat(
+    [frequencia_observada, frequencia_simulada],
+    axis=1,
+).fillna(0).reset_index(names="qtd_reclamacoes")
+
+limite_grafico = int(min(10, comparacao_frequencias["qtd_reclamacoes"].max()))
+grafico_freq = comparacao_frequencias.loc[
+    comparacao_frequencias["qtd_reclamacoes"].le(limite_grafico)
+].melt(
+    id_vars="qtd_reclamacoes",
+    value_vars=["observado", "simulado"],
+    var_name="serie",
+    value_name="frequencia",
+)
+
+plt.figure(figsize=(11, 6))
+sns.barplot(
+    data=grafico_freq,
+    x="qtd_reclamacoes",
+    y="frequencia",
+    hue="serie",
+    palette=["#2C7FB8", "#F28E2B"],
+)
+plt.title("Frequencia observada versus simulada pelo ZINB")
+plt.xlabel("Quantidade de reclamacoes")
+plt.ylabel("Frequencia")
+plt.tight_layout()
+plt.savefig(PASTA_GRAFICOS / "02_observado_vs_simulado.png", dpi=160)
+plt.close()
+
+plt.figure(figsize=(11, 6))
+sns.histplot(
+    data=dados_modelo.loc[dados_modelo["qtd_reclamacoes"].eq(0)],
+    x="score_reclamacao_silenciosa",
+    hue="classificacao_cliente",
+    bins=30,
+    multiple="stack",
+)
+plt.title("Distribuicao do score de reclamacao silenciosa")
+plt.xlabel("Score de reclamacao silenciosa")
+plt.ylabel("Quantidade de observacoes")
+plt.tight_layout()
+plt.savefig(PASTA_GRAFICOS / "03_score_reclamacao_silenciosa.png", dpi=160)
+plt.close()
+
+# Residuos aproximados do componente de contagem.
+residuos_quantile = quantil_residuo_aleatorizado(
+    y.to_numpy(),
+    mu,
+    alpha,
+)
+dados_modelo["residuo_quantile_aproximado"] = residuos_quantile
+
+plt.figure(figsize=(10, 6))
+plt.scatter(
+    dados_modelo["reclamacoes_esperadas"],
+    residuos_quantile,
+    alpha=0.25,
+    s=18,
+    color="#2C7FB8",
+)
+plt.axhline(0, color="black", linestyle="--", linewidth=1)
+plt.title("Residuos quantilicos aproximados versus valor esperado")
+plt.xlabel("Reclamacoes esperadas")
+plt.ylabel("Residuo quantilico aproximado")
+plt.tight_layout()
+plt.savefig(PASTA_GRAFICOS / "04_residuos_vs_esperado.png", dpi=160)
+plt.close()
+
+# ============================================================
+# 15. EXPORTACAO PARA EXCEL
+# ============================================================
+
+with pd.ExcelWriter(ARQUIVO_SAIDA, engine="openpyxl") as writer:
+    resumo_base.to_excel(writer, sheet_name="resumo_base", index=False)
+    comparacao_modelos.to_excel(writer, sheet_name="comparacao_modelos", index=False)
+    coeficientes_poisson.to_excel(writer, sheet_name="coef_poisson", index=False)
+    coeficientes_nb.to_excel(writer, sheet_name="coef_binomial_neg", index=False)
+    coeficientes_zip.to_excel(writer, sheet_name="coef_zip", index=False)
+    coeficientes_zinb.to_excel(writer, sheet_name="coef_zinb", index=False)
+    vif.to_excel(writer, sheet_name="vif", index=False)
+    dados_modelo.to_excel(writer, sheet_name="resultados_completos", index=False)
+    ranking_silenciosos.to_excel(writer, sheet_name="ranking_silenciosos", index=False)
+    resumo_classificacao.to_excel(writer, sheet_name="resumo_classificacao", index=False)
+    validacao_churn.to_excel(writer, sheet_name="validacao_churn", index=False)
+    comparacao_frequencias.to_excel(writer, sheet_name="freq_observada_simulada", index=False)
+
+    if not avaliacao_ground_truth.empty:
+        avaliacao_ground_truth.to_excel(
+            writer,
+            sheet_name="avaliacao_ground_truth",
+            index=False,
+        )
+    if not matriz_confusao.empty:
+        matriz_confusao.to_excel(
+            writer,
+            sheet_name="matriz_confusao",
+            index=False,
+        )
+
+print("\n" + "=" * 70)
+print("PROCESSAMENTO CONCLUIDO")
+print("=" * 70)
+print(f"Melhor modelo por AIC: {comparacao_modelos.iloc[0]['modelo']}")
+print(f"Arquivo de resultados: {ARQUIVO_SAIDA}")
+print(f"Graficos: {PASTA_GRAFICOS}")
+print("\nResumo das classificacoes:")
+print(resumo_classificacao.to_string(index=False))
+
+#aqui que dados e estrategia se apoiam para melhorar a jornada
+#utilizando modelos de zeros inflacionados para separar
+#quem nunca faria a acao de quem poderia fazer
+#mas por acaso naquele momento o resultado foi zero
+#assim podemos prever a realidade muito melhor.
+#Certo?
